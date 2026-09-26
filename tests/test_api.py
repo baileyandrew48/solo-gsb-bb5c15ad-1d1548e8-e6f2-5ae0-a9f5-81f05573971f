@@ -1314,3 +1314,150 @@ def test_trace_reading_reuses_assemble_segment_limits():
 def test_trace_reading_index_lists_endpoint():
     info = client.get("/").json()
     assert info["trace_reading"] == "POST /api/trace-reading"
+
+
+def test_audit_transposition_endpoint_unique_solution():
+    resp = client.post(
+        "/api/audit-transposition",
+        json={
+            "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "reference": "甲乙戊己庚丙丁辛",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "甲乙丙丁戊己庚辛"
+    assert data["reference"] == "甲乙戊己庚丙丁辛"
+    assert data["start"] == 2
+    assert data["end"] == 4
+    assert data["insert_at"] == 5
+    assert data["moved"] == "丙丁"
+    assert data["sources"] == [
+        [{"segment": 0, "pos": 2}],
+        [{"segment": 0, "pos": 3}],
+    ]
+    # 拼接文本与 /api/assemble 一致，接口不改写
+    assert data["text"] == client.post(
+        "/api/assemble", json={"segments": ["甲乙丙丁戊己", "戊己庚辛"]}
+    ).json()["text"]
+
+
+def test_audit_transposition_wildcard_compatible():
+    # 参照稿第 7 字为 ?：2 字操作的移位片段只剩 1 个两侧已知且相同的字，
+    # 唯一解为 3 字操作 (4,7,2)
+    resp = client.post(
+        "/api/audit-transposition",
+        json={
+            "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "reference": "甲乙戊己庚丙?辛",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert (data["start"], data["end"], data["insert_at"]) == (4, 7, 2)
+    assert data["moved"] == "戊己庚"
+
+
+def test_audit_transposition_tie_returns_409():
+    # "丙丁" 右移与 "戊己" 左移同为 2 字操作且都还原参照稿
+    resp = client.post(
+        "/api/audit-transposition",
+        json={
+            "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "reference": "甲乙戊己丙丁庚辛",
+        },
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["moved_len"] == 2
+    ops = detail["ties"]
+    assert len(ops) == 2
+    assert [(o["start"], o["end"], o["insert_at"]) for o in ops] == [
+        (2, 4, 4),
+        (4, 6, 2),
+    ]
+    assert ops[0]["moved"] == "丙丁"
+    assert ops[1]["moved"] == "戊己"
+    for op in ops:
+        assert len(op["sources"]) == 2
+
+
+def test_audit_transposition_no_solution_returns_422():
+    # 参照稿含原稿没有的 "子"：任何移位都无法让该位置吻合
+    resp = client.post(
+        "/api/audit-transposition",
+        json={
+            "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+            "reference": "甲乙丙丁戊己庚子",
+        },
+    )
+    assert resp.status_code == 422
+    assert "message" in resp.json()["detail"]
+
+
+def test_audit_transposition_requirements_validated():
+    base = {"segments": ["甲乙丙丁戊己", "戊己庚辛"]}
+    # 两稿不等长
+    assert client.post(
+        "/api/audit-transposition",
+        json={**base, "reference": "甲乙丙丁戊己庚辛壬"},
+    ).status_code == 422
+    # 等长但无已知字冲突（完全一致 / 仅差 ?）
+    assert client.post(
+        "/api/audit-transposition",
+        json={**base, "reference": "甲乙丙丁戊己庚辛"},
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-transposition",
+        json={**base, "reference": "甲乙丙?戊己庚辛"},
+    ).status_code == 422
+    # 缺 reference / 空 reference / 超 120 字
+    assert client.post("/api/audit-transposition", json=base).status_code == 422
+    assert client.post(
+        "/api/audit-transposition", json={**base, "reference": ""}
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-transposition", json={**base, "reference": "字" * 121}
+    ).status_code == 422
+
+
+def test_audit_transposition_assembly_failure_returns_422():
+    resp = client.post(
+        "/api/audit-transposition",
+        json={
+            "segments": ["孔子曰未知", "未知生焉", "完全无关文本"],
+            "reference": "字字字字字字字字字字字字",
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
+
+
+def test_audit_transposition_reuses_assemble_segment_limits():
+    ref = "甲乙戊己庚丙丁辛"
+    # 段数不足 / 超上限
+    assert client.post(
+        "/api/audit-transposition", json={"segments": ["abc"], "reference": ref}
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-transposition",
+        json={"segments": ["aa", "bb", "cc", "dd", "ee", "ff"], "reference": ref},
+    ).status_code == 422
+    # 单段过长 / 总长超限 / 空段
+    assert client.post(
+        "/api/audit-transposition",
+        json={"segments": ["a" * 500, "b" * 501], "reference": ref},
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-transposition",
+        json={"segments": ["字" * 400, "字" * 401], "reference": ref},
+    ).status_code == 422
+    assert client.post(
+        "/api/audit-transposition",
+        json={"segments": ["abc", ""], "reference": ref},
+    ).status_code == 422
+
+
+def test_audit_transposition_index_lists_endpoint():
+    info = client.get("/").json()
+    assert info["audit_transposition"] == "POST /api/audit-transposition"

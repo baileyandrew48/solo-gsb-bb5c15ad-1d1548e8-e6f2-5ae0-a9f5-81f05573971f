@@ -47,6 +47,14 @@
   同段连续取字原文下标须逐次加一，换段仅可发生在交界两侧都同时携带换前、
   换后段来源处）；为整个区间求证据路径，依次最小化换段次数与所选 ``?``
   数，同分按段序号、原文下标序列字典序取首，并标记是否存在其他同分路径。
+- ``POST /api/audit-transposition``：提交与 ``/api/assemble`` 相同的有序
+  segments 及一段独立参照转写 reference（两稿须等长且均不超过 120 字，
+  且两稿间须存在已知字冲突），复用其拼接文本和逐字来源，诊断“一段连续的
+  2～12 字被移到另一位置”的情形：枚举原稿左闭右开区间，剪下后按剩余文本
+  的插入下标放回（排除原位及重排后未改变文本的操作），逐字与参照稿比较
+  （相同字或任一侧为 ``?`` 算吻合，移位片段至少有 2 个两侧已知且相同的
+  字），按移位长度最短取解；唯一解返回原区间、剪下后的插入下标、移位文本
+  及原区间逐字 sources，同长度多解返回 409 和两种操作，无解返回 422。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -98,6 +106,15 @@ from .omission import (
 from .repetition import find_repetition
 from .reviser import EditConflictError, EditLocationError, revise
 from .tracer import TraceReadingError, trace_reading
+from .transposition import (
+    MAX_TEXT_LEN as AUDIT_TRANSPOSITION_MAX_TEXT_LEN,
+)
+from .transposition import (
+    TranspositionNotFoundError,
+    TranspositionRequirementError,
+    TranspositionTieError,
+    audit_transposition,
+)
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
 MAX_SEGMENTS = 5     # /api/assemble 最大段数
@@ -712,6 +729,44 @@ class TraceReadingResponse(BaseModel):
     )
 
 
+class AuditTranspositionRequest(AssembleRequest):
+    """移位审计请求：与 /api/assemble 相同的有序 segments，外加独立参照转写。"""
+
+    reference: str = Field(
+        ...,
+        min_length=1,
+        max_length=AUDIT_TRANSPOSITION_MAX_TEXT_LEN,
+        description="独立参照转写（1～120 字），须与拼接文本等长且两稿均不超过 "
+                    "120 字；未辨认字以 ? 表示，可与拼接文本中的 ? 免异字配对",
+        examples=["甲乙戊己庚丙丁辛"],
+    )
+
+
+class TranspositionOperation(BaseModel):
+    """一个移位操作：剪下原区间 [start, end) 后插入剩余文本的 insert_at 处。"""
+
+    start: int = Field(..., description="原区间起点下标（含，从 0 开始）")
+    end: int = Field(..., description="原区间终点下标（不含，左闭右开）")
+    insert_at: int = Field(
+        ...,
+        description="剪下后在剩余文本中的插入下标（从 0 开始，不等于 start）："
+                    "重排文本 = rem[:insert_at] + moved + rem[insert_at:]，"
+                    "其中 rem 为剪下原区间后的剩余文本",
+    )
+    moved: str = Field(..., description="移位文本，即 text[start:end]（2～12 字）")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="原区间逐字来源列表，与 moved 等长，规则与 /api/assemble 一致",
+    )
+
+
+class AuditTranspositionResponse(TranspositionOperation):
+    """唯一移位操作时的审计结果。"""
+
+    text: str = Field(..., description="拼接文本（与 /api/assemble 的结果一致，不被改写）")
+    reference: str = Field(..., description="原样回显的独立参照转写")
+
+
 @app.get("/", summary="服务信息")
 def index():
     return {
@@ -727,6 +782,7 @@ def index():
         "audit_omission": "POST /api/audit-omission",
         "compare_editions": "POST /api/compare-editions",
         "trace_reading": "POST /api/trace-reading",
+        "audit_transposition": "POST /api/audit-transposition",
         "docs": "/docs",
         "health": "/health",
     }
@@ -1401,4 +1457,110 @@ def api_trace_reading(req: TraceReadingRequest):
         raise HTTPException(
             status_code=422,
             detail={"message": str(exc)},
+        ) from exc
+
+
+@app.post(
+    "/api/audit-transposition",
+    response_model=AuditTranspositionResponse,
+    status_code=200,
+    summary="诊断拼接稿中一段连续文字被移到另一位置",
+    description=(
+        "请求沿用 `/api/assemble` 的 segments 限制（2～5 段、单段最长 500 字、"
+        "总长最长 800 字）与续接门槛（不满足返回 422 并给出 failed_segment），"
+        "另附一段**独立参照转写** `reference`（1～120 字）。接口先复用其拼接"
+        "得到拼接文本与逐字来源；**两稿须等长且均不超过 120 字**，且拼接稿与"
+        "参照稿之间须存在**已知字冲突**（双方皆已知且异字的位置），否则返回 "
+        "**422**。随后诊断“一段连续的 **2～12** 字被移到另一位置”的情形："
+        "枚举拼接稿的**左闭右开区间** `[start, end)`，剪下后按**剩余文本的"
+        "插入下标** `insert_at` 放回（重排文本 = `rem[:insert_at] + moved + "
+        "rem[insert_at:]`，`rem` 为剪下后的剩余文本），**排除原位**"
+        "（`insert_at == start`）及**重排后未改变文本**的操作；重排文本"
+        "**逐字与参照稿比较**，相同字或任一侧为 `?` 算吻合，须全部位置吻合，"
+        "且**移位片段在其新位置上至少有 2 个两侧已知且相同的字**。按**移位"
+        "长度最短**取解：唯一解返回原区间、剪下后的插入下标、移位文本及原"
+        "区间逐字 sources；**同长度多解**返回 **409** 并给出两种操作（按区间"
+        "起点、插入下标升序取前两个）；**无解**返回 **422**。结果仅供人工"
+        "复核，**不改写拼接稿**。"
+    ),
+    responses={
+        409: {
+            "description": "最短移位长度由多个不同操作并列取得，无法唯一确定",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "最短移位长度 2 字的合格操作有 2 个并列，无法唯一确定移位操作",
+                            "moved_len": 2,
+                            "ties": [
+                                {
+                                    "start": 2,
+                                    "end": 4,
+                                    "insert_at": 4,
+                                    "moved": "丙丁",
+                                    "sources": [
+                                        [{"segment": 0, "pos": 2}],
+                                        [{"segment": 0, "pos": 3}],
+                                    ],
+                                },
+                                {
+                                    "start": 4,
+                                    "end": 6,
+                                    "insert_at": 2,
+                                    "moved": "戊己",
+                                    "sources": [
+                                        [
+                                            {"segment": 0, "pos": 4},
+                                            {"segment": 1, "pos": 0},
+                                        ],
+                                        [
+                                            {"segment": 0, "pos": 5},
+                                            {"segment": 1, "pos": 1},
+                                        ],
+                                    ],
+                                },
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+        422: {
+            "description": "续接失败、两稿不等长/超 120 字/无已知字冲突，或无合格移位操作",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "参照稿 9 字、拼接稿 8 字，两稿须等长，不适用移位诊断"
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def api_audit_transposition(req: AuditTranspositionRequest):
+    try:
+        return audit_transposition(req.segments, req.reference)
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+    except (TranspositionRequirementError, TranspositionNotFoundError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
+        ) from exc
+    except TranspositionTieError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "moved_len": exc.moved_len,
+                "ties": exc.ties,
+            },
         ) from exc

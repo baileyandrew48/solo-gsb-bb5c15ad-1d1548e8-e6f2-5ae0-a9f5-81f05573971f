@@ -48,6 +48,13 @@
 **所选 `?` 数**，同分按**段序号、原文下标序列字典序取首**，并以 `ambiguous` 标记是否还有其他同分路径；
 返回区间文本、每段路径的拼接稿及原文左闭右开区间、换段位置与所选 `?` 位置。区间非法或无完整路径
 返回 **422**。
+- **`POST /api/audit-transposition`**：提交与 `/api/assemble` 相同的有序 `segments` 及一段独立参照转写
+`reference`（两稿须**等长**且均不超过 **120** 字，且两稿间须存在**已知字冲突**），复用拼接文本与逐字
+来源，诊断**一段连续的 2～12 字被移到另一位置**的情形：枚举原稿左闭右开区间，剪下后按**剩余文本的
+插入下标**放回（排除原位及重排后未改变文本的操作），逐字与参照稿比较（相同字或任一侧 `?` 算吻合，
+移位片段至少 **2** 个两侧已知且相同的字），按**移位长度最短**取解；唯一解返回原区间、剪下后的插入
+下标、移位文本及原区间逐字 `sources`，同长度多解返回 **409**（两种操作），无解返回 **422**；
+只提示，不改写拼接稿。
 
 ## 快速开始
 
@@ -1376,6 +1383,151 @@ curl -X POST http://localhost:8000/api/trace-reading \
 区间为空（`start == end`）、`start > end`、`end` 超出拼接文本长度、`start`/`end` 为负或缺字段，
 同样返回 **422**；续接失败时给出 `failed_segment`（从 0 开始）。接口**只做证据追溯，不改写拼接文本**。
 
+### `POST /api/audit-transposition`
+
+供校勘人员以一份**独立参照转写**（如另一藏本）诊断拼接稿中**一段连续文字被移到另一位置**的情形。
+请求的 `segments` 与 `/api/assemble` 完全相同（沿用 2～5 段、单段最长 500 字、总长最长 800 字的
+限制与续接门槛，续接失败同样返回 **422** 并给出 `failed_segment`），另附参照转写 `reference`
+（**1～120** 字，未辨认字也以 `?` 表示）。接口先复用 `/api/assemble` 得到拼接文本与逐字来源，再：
+
+- **长度前提**：两稿须**等长**且均不超过 **120** 字，否则返回 **422**；
+- **冲突前提**：拼接稿与参照稿之间须存在**已知字冲突**（双方皆已知且异字的位置）——两稿已逐字
+  吻合（或仅差 `?`）时无移位可诊断，返回 **422**；
+- **枚举移位操作**：枚举拼接稿的**左闭右开区间** `[start, end)`（长度 **2～12** 字），把该区间剪下，
+  得到剩余文本 `rem = text[:start] + text[end:]`（长 `n - L`），再按剩余文本的**插入下标** `insert_at`
+  （`0 ≤ insert_at ≤ n - L`）放回，重排文本为 `rem[:insert_at] + moved + rem[insert_at:]`；
+  **排除原位**（`insert_at == start`，必然还原原文）及**重排后未改变文本**的操作；
+- **判定**：重排文本**逐字与参照稿比较**，相同字或任一侧为 `?` 算吻合；须**全部位置吻合**，且
+  **移位片段在其新位置上至少有 2 个两侧已知且相同的字**（避免全 `?` 片段造成误报），方为合格操作；
+- **择优**：按**移位长度最短**取解。最短长度下操作唯一时返回该操作；最短长度存在多个不同操作时
+  返回 **409**，`detail.ties` 给出**两种操作**（按区间起点、插入下标升序取前两个，`detail.moved_len`
+  为并列的移位长度）；不存在合格操作时返回 **422**。
+
+接口**只做审计提示，不改写拼接文本**；唯一解返回的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `text` | 拼接文本（与 `/api/assemble` 一致，不被改写） |
+| `reference` | 原样回显的独立参照转写 |
+| `start` / `end` | 被移走文字在拼接文本中的原区间（下标从 0 开始，**左闭右开** `[start, end)`） |
+| `insert_at` | 剪下后在**剩余文本**中的插入下标（从 0 开始，不等于 `start`）：重排文本 = `rem[:insert_at] + moved + rem[insert_at:]` |
+| `moved` | 移位文本，即 `text[start:end]`（2～12 字） |
+| `sources` | 原区间逐字来源列表，与 `moved` 等长，规则与 `/api/assemble` 一致 |
+
+请求体：
+
+```json
+{
+  "segments": ["甲乙丙丁戊己", "戊己庚辛"],
+  "reference": "甲乙戊己庚丙丁辛"
+}
+```
+
+- `segments`：必填，2～5 个非空字符串；单段最长 500 字，各段总长最长 800 字（同 `/api/assemble`）。
+- `reference`：必填，**1～120** 字的独立参照转写，须与拼接文本等长。
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8000/api/audit-transposition \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲乙丙丁戊己", "戊己庚辛"], "reference": "甲乙戊己庚丙丁辛"}'
+```
+
+响应示例（拼接文本 `甲乙丙丁戊己庚辛` 中 `丙丁`（区间 `[2,4)`）被移到 `庚` 之后：剪下后剩余文本为
+`甲乙戊己庚辛`，插入下标 5 处即还原参照稿；等价的 `戊己庚` 左移为 3 字操作，最短长度 2 唯一）：
+
+```json
+{
+  "text": "甲乙丙丁戊己庚辛",
+  "reference": "甲乙戊己庚丙丁辛",
+  "start": 2,
+  "end": 4,
+  "insert_at": 5,
+  "moved": "丙丁",
+  "sources": [
+    [{ "segment": 0, "pos": 2 }],
+    [{ "segment": 0, "pos": 3 }]
+  ]
+}
+```
+
+任一侧含 `?` 的字符对算吻合——下例参照稿第 7 字为 `?`，2 字操作移 `丙丁` 后片段只剩 1 个两侧已知
+且相同的字（`丁` 对 `?` 不计入），不足 2 字门槛，唯一解为 3 字操作（移 `戊己庚`）：
+
+```bash
+curl -X POST http://localhost:8000/api/audit-transposition \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲乙丙丁戊己", "戊己庚辛"], "reference": "甲乙戊己庚丙?辛"}'
+```
+
+```json
+{
+  "text": "甲乙丙丁戊己庚辛",
+  "reference": "甲乙戊己庚丙?辛",
+  "start": 4,
+  "end": 7,
+  "insert_at": 2,
+  "moved": "戊己庚",
+  "sources": [
+    [{ "segment": 0, "pos": 4 }, { "segment": 1, "pos": 0 }],
+    [{ "segment": 0, "pos": 5 }, { "segment": 1, "pos": 1 }],
+    [{ "segment": 1, "pos": 2 }]
+  ]
+}
+```
+
+**同长度多解（409）**示例——相邻两字块 `丙丁`、`戊己` 互换位置时，"移 `丙丁` 到右"与"移 `戊己` 到左"
+同为最短的 2 字操作且都还原参照稿，接口不擅自选择，返回两种操作：
+
+```bash
+curl -X POST http://localhost:8000/api/audit-transposition \
+  -H "Content-Type: application/json" \
+  -d '{"segments": ["甲乙丙丁戊己", "戊己庚辛"], "reference": "甲乙戊己丙丁庚辛"}'
+```
+
+```json
+{
+  "detail": {
+    "message": "最短移位长度 2 字的合格操作有 2 个并列，无法唯一确定移位操作",
+    "moved_len": 2,
+    "ties": [
+      {
+        "start": 2,
+        "end": 4,
+        "insert_at": 4,
+        "moved": "丙丁",
+        "sources": [[{ "segment": 0, "pos": 2 }], [{ "segment": 0, "pos": 3 }]]
+      },
+      {
+        "start": 4,
+        "end": 6,
+        "insert_at": 2,
+        "moved": "戊己",
+        "sources": [
+          [{ "segment": 0, "pos": 4 }, { "segment": 1, "pos": 0 }],
+          [{ "segment": 0, "pos": 5 }, { "segment": 1, "pos": 1 }]
+        ]
+      }
+    ]
+  }
+}
+```
+
+**无解（422）**示例——参照稿含有拼接稿没有的字，任何移位都无法让该位置吻合：
+
+```json
+{
+  "detail": {
+    "message": "枚举全部 2～8 字连续区间的剪下重放后，没有使重排文本与参照稿逐字吻合的合格移位操作"
+  }
+}
+```
+
+两稿不等长、超过 120 字、无已知字冲突（完全一致或仅差 `?`）、参照为空或缺字段，或 segments 不满足
+`/api/assemble` 的段数/长度限制、续接失败，同样返回 **422**（续接失败时给出 `failed_segment`，
+从 0 开始）。
+
 ## 计分与并列规则
 
 - 相同字 **+2**；`?` 与任意字配对 **0**；异字 **-2**；
@@ -1430,6 +1582,12 @@ curl -X POST http://localhost:8000/api/trace-reading \
   次数、所选 `?` 数，同分按段序号序列、原文下标序列字典序取首，`ambiguous` 标记是否存在其他同分
   路径；返回区间文本、每段路径的拼接稿及原文左闭右开区间（各带片段与逐字所选来源）、换段位置与
   所选 `?` 位置；区间非法或无完整路径返回 422；只追溯证据，不改写拼接文本。
+- `/api/audit-transposition` 复用 `/api/assemble` 的拼接文本与逐字来源（沿用段数/长度限制与续接
+  失败规则），参照稿（≤120 字）须与拼接稿等长且两稿间存在已知字冲突。枚举拼接稿 2～12 字连续区间，
+  剪下后按剩余文本的插入下标放回（排除原位及重排后未改变文本的操作），重排文本逐字与参照稿比较
+  （相同字或任一侧 `?` 算吻合，须全部位置吻合，且移位片段至少 2 个两侧已知且相同的字），按移位
+  长度最短取解：唯一解返回原区间、剪下后的插入下标、移位文本与原区间逐字 sources，同长度多解
+  返回 **409**（两种操作），无解返回 **422**；只提示，不改写拼接稿。
 
 ## 本地开发（不使用 Docker）
 
@@ -1459,7 +1617,8 @@ app/
   omission.py   # 脱漏审计：段间接缝枚举 + 参照稿连续缺文补入后逐位异字数（前/后缀和）择优与并列判定
   comparator.py # 双版本对勘：两份拼接稿的全局逐字最小编辑 DP（对角/删除/插入择优 + 路径歧义标记）+ 非零列合并差异块
   tracer.py     # 通读证据路径：区间逐字选合格来源（原字相等或为 ?），同段下标逐次加一、换段须两侧双覆盖的逐层 DP（最少换段→最少 ?→字典序取首 + 同分路径歧义标记）
-  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition、/api/audit-omission、/api/compare-editions、/api/trace-reading）
+  transposition.py # 移位审计：枚举 2～12 字连续区间剪下重放（排除原位与无变化操作），重排文本与参照稿逐字吻合判定（含 ? 免异字、片段已知相同位门槛），按移位长度最短择优与并列判定
+  main.py       # FastAPI 接口与请求/响应模型（/api/align、/api/assemble、/api/collate、/api/order、/api/revise、/api/locate-quote、/api/locate-quotes、/api/find-repetition、/api/audit-omission、/api/compare-editions、/api/trace-reading、/api/audit-transposition）
 tests/          # 算法与接口测试
 Dockerfile      # 镜像构建（含依赖安装）
 docker-compose.yml
